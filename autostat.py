@@ -166,6 +166,13 @@ class QuantileMessenger(poutine.messenger.Messenger):
             ix = (quantiles < self.thresh).sum()
             msg['fn'].logits[sorted_probs.indices[ix+1:]] = -torch.inf
 
+class MAPMessenger(poutine.messenger.Messenger):
+    def _pyro_sample(self, msg):
+        if type(msg['fn']) == Categorical:
+            ix = torch.argmax(msg['fn'].probs)
+            msg['fn'].logits[ix+1:] = -torch.inf
+            msg['fn'].logits[:ix] = -torch.inf
+
 def deep_escape(depth, msg):
     return (type(msg['name']) is Prog and
         len(msg['name'].adds) >= depth and
@@ -184,8 +191,3 @@ def all_in_quantile(fn, k):
     while not q.empty():
         samples.append(enum_model())
     return samples
-
-
-# for _ in range(10):
-#     prog, logp, kern, newkern = a.path_guide(KERNS)
-#     print(prog)
