@@ -152,6 +152,9 @@ def num_parents(prog):
 class DoneException(Exception):
     pass
 
+class RejectException(Exception):
+    pass
+
 def prior_logprob(kern):
     res = torch.tensor(0.)
     for name, module, prior, closure, _ in kern.named_priors():
@@ -165,46 +168,66 @@ class Categorical(dist.Categorical):
         mask = probs > -torch.inf
         return result[mask]
 
-# Problem: this isn't right. 
-# We don't just want to take the top k at every site. 
-# We want the top k overall. 
-# Which means we want something like the queue messenger,
-# But we actually want a Priority queue.
-# we should also return the log probs. 
-
-class TopKMessenger(poutine.messenger.Messenger):
-    def __init__(self, k):
-        self.k = k
+class QuantileMessenger(poutine.messenger.Messenger):
+    def __init__(self, thresh):
+        self.thresh = thresh
 
     def _pyro_sample(self, msg):
         if type(msg['fn']) == Categorical:
-            n = msg['fn'].logits.shape[0]
-            _, indices = msg['fn'].logits.topk(n - self.k, largest=False)
-            msg['fn'].logits[indices] = -torch.inf
+            sorted_probs = msg['fn'].probs.sort(descending=True)
+            quantiles = torch.cumsum(sorted_probs.values, 0)
+            ix = (quantiles < self.thresh).sum()
+            msg['fn'].logits[sorted_probs.indices[ix+1:]] = -torch.inf
 
-# Ideally, we just want to run the model, using a handler
-# that picks the top k. There's queues in pyro for enumeration too. 
-def topk(fn, k):
+# This won't work, because we call the function and interrupt it
+# to do the queue handler. We need to make the sample sites have the info. 
+class GreedyAuxMessenger(poutine.messenger.Messenger):
+    def __init__(self, limit):
+        self.seen = 0
+        self.limit = limit
+    def _pyro_post_sample(self, msg):
+        if type(msg['fn']) == Categorical:
+            if msg['value'] != 0 and self.seen >= self.limit \
+                    and msg['fn'].probs[0] > 0:
+                raise RejectException()
+            if msg['value'] == 1:
+                self.seen += 1
+                print("Now seen", self.seen)
+
+# TODO: optimize the hyperparams too
+def greedy_search(fn, depth):
+    best_logprob = -torch.inf
+    best_level_logprob = -torch.inf
+    best_sofar = None
+    best_level_sofar = poutine.Trace()
+    for d in range(1, depth+1):
+        q = Queue()
+        q.put(best_level_sofar)
+        while not q.empty():
+            try:
+                with GreedyAuxMessenger(d):
+                    with poutine.trace() as capture:
+                        result = poutine.queue(fn, queue=q)()
+                trace = capture.trace
+                logprob = trace.log_prob_sum()
+                if logprob >= best_logprob:
+                    best_sofar = result
+                    best_logprob = logprob
+                if logprob >= best_level_logprob:
+                    best_level_sofar = trace
+                    best_level_logprob = logprob
+            except RejectException:
+                pass
+    return best_sofar
+
+def all_in_quantile(fn, k):
     q = Queue()
     q.put(poutine.Trace())
-    enum_model = poutine.queue(TopKMessenger(k)(fn), queue=q)
+    enum_model = poutine.queue(QuantileMessenger(k)(fn), queue=q)
     samples = []
     while not q.empty():
-        trace = poutine.trace(enum_model).get_trace()
-        samples.append(trace.nodes['a']["value"])
+        samples.append(enum_model())
     return samples
-
-# TODO: finish this.
-def greedy_search(p):
-    v = valid_actions(p)
-    actions = [Action(i+1) for (i,b) in enumerate(v) if b]
-    for a in actions:
-        step(p, a)
-    # Optimize all the valid actions (not including Done or Add)
-    # Pick the best scoring one. 
-    # Then, either Add or do another multiply
-    # Repeat with the best of these. 
-    # The greedy search doesn't look at Done. 
 
 
 # for _ in range(10):
