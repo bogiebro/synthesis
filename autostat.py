@@ -16,12 +16,10 @@ from queue import Queue
 from pyrsistent import pset
 import functools
 
-# Show top k choices.
 # Try a neural parameterization
-# Compare with a forward prior. 
-# Add a prior to the kernel params.
 # Validation loss could also use the top 1. 
 # Or average the loss over the top percentile. 
+# 
 
 MEAN = gp.means.ZeroMean()
 
@@ -111,6 +109,9 @@ def path_guide(kerns):
         newkern = True
     return prog, logp, kerns[prog], newkern
 
+def get_path(kerns):
+    return path_guide(kerns)[0]
+
 def gp_model(prog, kern, x, y):
     pyro.module(f"kernel{hash(prog)}", kern)
     covar = kern(x)
@@ -183,11 +184,28 @@ def deep_escape(depth, msg):
 # as many as are in the appropriate quantile?
 # It may take inordinately long, but worth trying
 
-def all_in_quantile(fn, k):
+def all_in_quantile(fn, k, maxvals, *args):
     q = Queue()
     q.put(poutine.Trace())
     enum_model = poutine.queue(QuantileMessenger(k)(fn), queue=q)
     samples = []
-    while not q.empty():
-        samples.append(enum_model())
-    return samples
+    logprobs = []
+    while not q.empty() and (maxvals is None or len(samples) < maxvals):
+        with poutine.trace() as capture:
+            samples.append(enum_model(*args))
+        logprobs.append(capture.trace.log_prob_sum())
+    return samples, torch.tensor(logprobs)
+
+# Note: because finding the probability of a program in the prior is impossible,
+# this just shows the likelihood. Because it's OOD, this may be okay. 
+def validate(kerns, x, y):
+    validation = torch.tensor(0.0)
+    with torch.no_grad():
+        samples, logprobs = all_in_quantile(path_guide, 0.4, 50, kerns)
+        probs = torch.exp(logprobs)
+        probs /= probs.sum()
+        for i,s in enumerate(samples):
+            prog, logp, kern, _ = s
+            tr2 = poutine.trace(gp_model).get_trace(prog, kern, x, y)
+            validation += tr2.log_prob_sum() * probs[i]
+    return validation
