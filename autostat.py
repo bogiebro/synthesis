@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from itertools import chain
 from enum import Enum
 import itertools
@@ -13,6 +13,8 @@ from gpytorch.kernels import RBFKernel, PeriodicKernel, ScaleKernel, ProductKern
 from typing import Optional, Callable
 from gpytorch.priors import GammaPrior, NormalPrior
 from queue import Queue
+from pyrsistent import pset
+import functools
 
 # Compare training losses for REINFORCE and gflownet.
 # Show top k choices.
@@ -29,73 +31,54 @@ from queue import Queue
 # Validation loss could also use the top 1. 
 # Or average the loss over the top percentile. 
 
-def kerns(a):
-    return [b.__name__ for b in a]
+Prog = namedtuple('Prog', 'builder adds done')
 
-class Prog:
-    def __init__(self):
-        self.builder = set()
-        self.adds = set()
-        self.done = False
-    def __str__(self):
-        return f"Prog({self.done} {kerns(self.builder)} {[kerns(a) for a in self.adds]})"
+def new_prog():
+    return Prog(pset([]), pset([]), False)
 
-def hash_prog(p: Prog) -> int:
-    return hash((p.done, frozenset(p.adds), frozenset(p.builder)))
-
-Action = Enum('Action', 'Done Add Periodic RBF Linear Matern')
+Action = Enum('Action', 'Done Add Periodic RBF Linear Matern RQ')
 
 def notseen(ty, p) -> bool:
     return ty not in p.builder and \
-        frozenset(chain([ty], p.builder)) not in p.adds
+        p.builder.add(ty) not in p.adds
 
 def valid_actions(p: Prog) -> torch.Tensor:
     return torch.tensor([
         len(p.builder) == 0 and len(p.adds) > 0,
         len(p.builder) > 0,
-        notseen(PeriodicKernel, p),
-        notseen(RBFKernel, p),
-        notseen(LinearKernel, p),
-        notseen(MaternKernel, p)])
+        notseen(Action.Periodic, p),
+        notseen(Action.RBF, p),
+        notseen(Action.Linear, p),
+        notseen(Action.Matern, p),
+        notseen(Action.RQ, p)])
 
 def step(p: Prog, a: Action):
     if a == Action.Done:
-        p.done = True
+        return p._replace(done = True)
     elif a == Action.Add:
-        p.adds.add(frozenset(p.builder))
-        p.builder = set()
-    elif a == Action.Periodic:
-        p.builder.add(PeriodicKernel)
-    elif a == Action.RBF:
-        p.builder.add(RBFKernel)
-    elif a == Action.Linear:
-        p.builder.add(LinearKernel)
-    elif a == Action.Matern:
-        p.builder.add(MaternKernel)
+        return Prog(pset([]), p.adds.add(p.builder), False)
     else:
-        assert False
+        return p._replace(builder=p.builder.add(a))
 
 def base_kernel(t):
-    if t is RBFKernel:
+    if t is Action.RBF:
         return RBFKernel(lengthscale_prior=GammaPrior(1, 1))
-    if t is MaternKernel:
-        return RBFKernel(lengthscale_prior=GammaPrior(1, 1))
-    if t is LinearKernel:
+    if t is Action.Matern:
+        return MaternKernel(lengthscale_prior=GammaPrior(1, 1))
+    if t is Action.Linear:
         return LinearKernel(
             offset_prior=NormalPrior(0, 5),
             variance_prior=GammaPrior(1,1))        
-    if t is PeriodicKernel:
+    if t is Action.Periodic:
         return PeriodicKernel(
             lengthscale_prior=GammaPrior(1,1),
             period_length_prior=GammaPrior(1,1))
-    if t is RQKernel:
+    if t is Action.RQ:
         return RQKernel(
             lengthscale_prior=GammaPrior(1,1),
             alpha_prior=GammaPrior(1,1))
 
 def to_kernel(p: Prog) -> gp.kernels.Kernel:
-    if len(p.builder) > 0:
-        p.adds.add(frozenset(p.builder))
     assert len(p.adds) > 0
     for a in p.adds:
         assert len(a) > 0
@@ -113,30 +96,29 @@ def init_params(p: Prog) -> Callable[[], torch.Tensor]:
     return inner
 
 def next_prog(logp: torch.Tensor, prog: Prog):
-    old_prog = hash_prog(prog)
-    logits = pyro.param("param " + str(old_prog), init_params(prog))
-    ix = pyro.sample(old_prog, Categorical(logits=logits))
+    logits = pyro.param(str(hash(prog)), init_params(prog))
+    ix = pyro.sample(prog, Categorical(logits=logits))
     action = Action(int(ix.item()) + 1)
-    step(prog, action)
-    logp -= torch.log(torch.tensor(num_parents(prog)))
+    prog2 = step(prog, action)
+    logp -= torch.log(torch.tensor(num_parents(prog2)))
+    return prog2
         
 def path_guide(kerns):
-    prog = Prog()
+    prog = new_prog()
     logp = torch.tensor(0.0)
     try:
         while not prog.done:
-            next_prog(logp, prog)
+            prog = next_prog(logp, prog)
     except DoneException:
         pass
     newkern = False
-    prog_hash = hash_prog(prog)
-    if prog_hash not in kerns:
-        kerns[prog_hash] = to_kernel(prog)
+    if prog not in kerns:
+        kerns[prog] = to_kernel(prog)
         newkern = True
-    return prog, logp, kerns[prog_hash], newkern
+    return prog, logp, kerns[prog], newkern
 
 def gp_model(prog, mean, kern, x, y):
-    pyro.module(f"kernel {hash_prog(prog)}", kern)
+    pyro.module(f"kernel{hash(prog)}", kern)
     pyro.module(f"mu", mean)
     covar = kern(x)
     covar = covar.add_diag(torch.tensor(0.001))
@@ -152,7 +134,7 @@ def num_parents(prog):
 class DoneException(Exception):
     pass
 
-class RejectException(Exception):
+class RejectException(poutine.NonlocalExit):
     pass
 
 def prior_logprob(kern):
@@ -168,6 +150,18 @@ class Categorical(dist.Categorical):
         mask = probs > -torch.inf
         return result[mask]
 
+class RejectionMessenger(poutine.messenger.Messenger):
+    def __init__(self, escape_fn):
+        super().__init__()
+        self.escape_fn = escape_fn
+    def _pyro_sample(self, msg):
+        if self.escape_fn(msg):
+            msg['done'] = True
+            msg['stop'] = True
+            def cont(m):
+                raise RejectException(m)
+            msg['continuation'] = cont
+
 class QuantileMessenger(poutine.messenger.Messenger):
     def __init__(self, thresh):
         self.thresh = thresh
@@ -179,45 +173,40 @@ class QuantileMessenger(poutine.messenger.Messenger):
             ix = (quantiles < self.thresh).sum()
             msg['fn'].logits[sorted_probs.indices[ix+1:]] = -torch.inf
 
-# This won't work, because we call the function and interrupt it
-# to do the queue handler. We need to make the sample sites have the info. 
-class GreedyAuxMessenger(poutine.messenger.Messenger):
-    def __init__(self, limit):
-        self.seen = 0
-        self.limit = limit
-    def _pyro_post_sample(self, msg):
-        if type(msg['fn']) == Categorical:
-            if msg['value'] != 0 and self.seen >= self.limit \
-                    and msg['fn'].probs[0] > 0:
-                raise RejectException()
-            if msg['value'] == 1:
-                self.seen += 1
-                print("Now seen", self.seen)
+def deep_escape(depth, msg):
+    return (type(msg['name']) is Prog and
+        len(msg['name'].adds) >= depth and
+        len(msg['name'].builder) > 0)
 
 # TODO: optimize the hyperparams too
 def greedy_search(fn, depth):
     best_logprob = -torch.inf
     best_level_logprob = -torch.inf
     best_sofar = None
-    best_level_sofar = poutine.Trace()
+    best_level_trace = poutine.Trace()
     for d in range(1, depth+1):
-        q = Queue()
-        q.put(best_level_sofar)
-        while not q.empty():
+        def wrapped():
             try:
-                with GreedyAuxMessenger(d):
-                    with poutine.trace() as capture:
-                        result = poutine.queue(fn, queue=q)()
+                with RejectionMessenger(functools.partial(deep_escape, d)):
+                    return fn()
+            except RejectException as site:
+                site.reset_stack()
+                return None
+        q = Queue()
+        q.put(best_level_trace)
+        queued = poutine.queue(wrapped, queue=q)
+        while not q.empty():
+            with poutine.trace() as capture:
+                res = queued()
+            if res is not None:
                 trace = capture.trace
                 logprob = trace.log_prob_sum()
                 if logprob >= best_logprob:
-                    best_sofar = result
+                    best_sofar = res
                     best_logprob = logprob
                 if logprob >= best_level_logprob:
-                    best_level_sofar = trace
+                    best_level_trace = trace
                     best_level_logprob = logprob
-            except RejectException:
-                pass
     return best_sofar
 
 def all_in_quantile(fn, k):
