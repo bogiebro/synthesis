@@ -16,27 +16,21 @@ from queue import Queue
 from pyrsistent import pset
 import functools
 
-# Compare training losses for REINFORCE and gflownet.
 # Show top k choices.
 # Try a neural parameterization
 # Compare with a forward prior. 
-# do we pick paths in proportion to reward? what exactly is the model
-# we're capturing?
-
 # Add a prior to the kernel params.
-
-# Should compare to greedy 
-# Use Pyrsistent, and replace hashes with entities
-
 # Validation loss could also use the top 1. 
 # Or average the loss over the top percentile. 
+
+MEAN = gp.means.ZeroMean()
 
 Prog = namedtuple('Prog', 'builder adds done')
 
 def new_prog():
     return Prog(pset([]), pset([]), False)
 
-Action = Enum('Action', 'Done Add Periodic RBF Linear Matern RQ')
+Action = Enum('Action', 'Done Add Periodic RBF Linear') # Matern RQ')
 
 def notseen(ty, p) -> bool:
     return ty not in p.builder and \
@@ -48,9 +42,9 @@ def valid_actions(p: Prog) -> torch.Tensor:
         len(p.builder) > 0,
         notseen(Action.Periodic, p),
         notseen(Action.RBF, p),
-        notseen(Action.Linear, p),
-        notseen(Action.Matern, p),
-        notseen(Action.RQ, p)])
+        notseen(Action.Linear, p)])
+        # notseen(Action.Matern, p),
+        # notseen(Action.RQ, p)])
 
 def step(p: Prog, a: Action):
     if a == Action.Done:
@@ -61,18 +55,18 @@ def step(p: Prog, a: Action):
         return p._replace(builder=p.builder.add(a))
 
 def base_kernel(t):
-    if t is Action.RBF:
-        return RBFKernel(lengthscale_prior=GammaPrior(1, 1))
-    if t is Action.Matern:
-        return MaternKernel(lengthscale_prior=GammaPrior(1, 1))
-    if t is Action.Linear:
-        return LinearKernel(
-            offset_prior=NormalPrior(0, 5),
-            variance_prior=GammaPrior(1,1))        
     if t is Action.Periodic:
         return PeriodicKernel(
             lengthscale_prior=GammaPrior(1,1),
             period_length_prior=GammaPrior(1,1))
+    if t is Action.RBF:
+        return RBFKernel(lengthscale_prior=GammaPrior(1, 1))
+    if t is Action.Linear:
+        return LinearKernel(
+            offset_prior=NormalPrior(0, 5),
+            variance_prior=GammaPrior(1,1))  
+    if t is Action.Matern:
+        return MaternKernel(lengthscale_prior=GammaPrior(1, 1))
     if t is Action.RQ:
         return RQKernel(
             lengthscale_prior=GammaPrior(1,1),
@@ -117,12 +111,11 @@ def path_guide(kerns):
         newkern = True
     return prog, logp, kerns[prog], newkern
 
-def gp_model(prog, mean, kern, x, y):
+def gp_model(prog, kern, x, y):
     pyro.module(f"kernel{hash(prog)}", kern)
-    pyro.module(f"mu", mean)
     covar = kern(x)
     covar = covar.add_diag(torch.tensor(0.001))
-    d = gp.distributions.MultivariateNormal(mean(x), covar)
+    d = gp.distributions.MultivariateNormal(MEAN(x), covar)
     return pyro.sample("y", d, obs=y)
 
 def num_parents(prog):
@@ -178,36 +171,10 @@ def deep_escape(depth, msg):
         len(msg['name'].adds) >= depth and
         len(msg['name'].builder) > 0)
 
-# TODO: optimize the hyperparams too
-def greedy_search(fn, depth):
-    best_logprob = -torch.inf
-    best_level_logprob = -torch.inf
-    best_sofar = None
-    best_level_trace = poutine.Trace()
-    for d in range(1, depth+1):
-        def wrapped():
-            try:
-                with RejectionMessenger(functools.partial(deep_escape, d)):
-                    return fn()
-            except RejectException as site:
-                site.reset_stack()
-                return None
-        q = Queue()
-        q.put(best_level_trace)
-        queued = poutine.queue(wrapped, queue=q)
-        while not q.empty():
-            with poutine.trace() as capture:
-                res = queued()
-            if res is not None:
-                trace = capture.trace
-                logprob = trace.log_prob_sum()
-                if logprob >= best_logprob:
-                    best_sofar = res
-                    best_logprob = logprob
-                if logprob >= best_level_logprob:
-                    best_level_trace = trace
-                    best_level_logprob = logprob
-    return best_sofar
+# Could we combine greedy_search with all_in_quantile?
+# So that we don't just keep 1 from the previous level, but
+# as many as are in the appropriate quantile?
+# It may take inordinately long, but worth trying
 
 def all_in_quantile(fn, k):
     q = Queue()
